@@ -1,0 +1,22 @@
+In Spark, Lineage Graph is a dependencies graph in between existing RDD and new RDD. It means that all the dependencies between the RDD will be recorded in a graph, rather than the original data
+The need for an RDD lineage graph happens when we want to compute new RDD or if we want to recover the lost data from the lost persisted RDD.
+
+What is DAG in Spark?
+DAG means that Directed Acyclic Graph(No directed cycles). It is a set of Edges and Vertices, where vertices act the RDDs. Edges act as the Operation to be applied on RDD. It is a collection of all transformation and actions.
+
+Lineage Graph vs DAG:
+
+
+Lineage Graph is dealing with only RDDs so it is applicable to transformations
+DAG(Directed Acyclic Graph) dealing with both transformation and actions
+DAF allows the user to dive into the stage and expanded details on any stage.
+
+Lineage Graph
+
+Lineage is the graph of how all the parent RDD’s are connected to the derived RDD’s. It hence is a graph of how each RDD is dependent on the other and how the transformations are applied to each RDD. Each RDD points to one or more parent along with the metadata about the type of relationship with the parent.
+
+For example: val result=data.map(), where result keeps a reference of the RDD data, that’s a lineage. This RDD lineage is used to recompute the data if there are any faults as it contains the pattern of the computation. toDebugString() method is used to display the RDD lineage.
+
+DAG (Directed Acyclic Graph)
+
+DAG (Directed Acyclic Graph) is a collection of all the RDD and the corresponding transformations on them. A DAG is created when the user creates a RDD and applies transformations on it, this results in a DAG. When the action is called, the DAG is given to the DAG Scheduler which divides it into stages. Spark DAG allows the user to look at the expanded stage and understand the various transformations on it. As the end to end plan is available, it can be optimized that is, we can mix the transformations and reduce the shuffling of data. The DAG does not have a dedicated storage but is in memory and not on disk. A DAG can help in fault tolerance.
