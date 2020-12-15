@@ -1,0 +1,310 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ##### POC:  
+# MAGIC Kyle White, Kyle.White@samsclub.com  
+# MAGIC Zhenyu Zhang, Zhenyu.Zhang@walmart.com
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Purpose
+# MAGIC The purpose of this notebook is to publish causal effect estimates already stored in intermediate Spark tables into a target data store
+# MAGIC for downstream consumers.
+# MAGIC 
+# MAGIC The overall flow of the notebook is:
+# MAGIC * Pull results and result set details from intermediate tables
+# MAGIC * Write result set details to target Gravity Azure SQL table (triggering autoincrement ID field values as Azure SQL results set IDs)
+# MAGIC * Determine the mapping from Azure SQL result set IDs to Databricks IDs
+# MAGIC * Map the IDs attached to the results from the DataBricks IDs to Azure SQL IDs
+# MAGIC * Write results to target Gravity Azure SQL table
+
+# COMMAND ----------
+
+# DBTITLE 1,Set configuration of notebook
+# Select the application environment we will load data for (i.e., which Azure SQL database we upload results to).
+dbutils.widgets.dropdown(name='env', defaultValue='dev-finance', choices=['dev-finance', 'prod-finance-ai', 'qa-finance-ai'])
+
+# Specify the Spark DataFrameWriter write mode when writing to a staging database table (e.g., Azure SQL).
+dbutils.widgets.dropdown(name='db_write_mode', defaultValue='overwrite', choices=['append', 'overwrite', 'ignore', 'error'])
+
+# Controls whether .show() actions will be run at the conclusion of each command cell. Setting this to
+# True can drastically slow down execution because steps are repeatedly executed.
+dbutils.widgets.dropdown(name='debug_print', defaultValue='False', choices=['True', 'False'])
+
+# Specify the name of an experiment.
+dbutils.widgets.dropdown(name='prepend_user', defaultValue='True', choices=['True','False'])
+dbutils.widgets.dropdown(name='experiment', defaultValue='0', choices=['0','1','2','3','4','5','6','7','8','9'])
+dbutils.widgets.text(name='db_name', defaultValue='causal_ds')
+
+# COMMAND ----------
+
+# DBTITLE 1,Set notebook constants and convenience functions
+import logging
+
+logFormatter = '%(asctime)s %(levelname)s %(filename)s$%(funcName)s$%(lineno)d: %(message)s'
+logging.basicConfig(format=logFormatter, level=logging.WARNING) # Use lower levels (e.g., DEBUG) for dev/debug
+logging.getLogger("py4j").setLevel(logging.ERROR)
+notebook_name = 'publish-causal-effect-estimates'
+_logger = logging.getLogger(notebook_name)
+
+debug_print = ('True' == dbutils.widgets.get('debug_print'))
+
+db_write_mode = dbutils.widgets.get('db_write_mode')
+env_name = dbutils.widgets.get('env')
+experiment = dbutils.widgets.get('experiment')
+db_name = dbutils.widgets.get('db_name')
+if dbutils.widgets.get('prepend_user')=='True':
+  user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
+  experiment = user.split('@') [0] + '_' + experiment
+
+results_causal_diagram_depth = 3
+
+# This notebook is currently expected to only load transformed results.
+# The transformation process doesn't alter or generate a new result details table
+# so you won't see a suffix on that table name.
+def construct_source_databricks_monthly_effect_table_names(experiment_qualifier):
+    """Return tuple of results and result details table names."""
+    return (f'{db_name}.causal_effect_month_{experiment_qualifier}_transformed_results',
+            f'{db_name}.causal_effect_month_{experiment_qualifier}_details')
+
+# Azure SQL database details. Gravity Azure SQL database information
+# can be found here: https://confluence.walmart.com/display/SASTDSE/Azure+SQL+server
+env_prefix = env_name.split('-')[0]
+azure_sql_results_table_name = 'sales_causal_explain'
+azure_sql_details_table_name = 'sales_causal_aux_details'
+jdbcHostname = f'{env_name}-db-server.database.windows.net'
+jdbcDatabase = f'{env_name}-db'
+jdbcPort = 1433
+jdbcUsername = dbutils.secrets.get(scope=f'asql_jdbc_{env_prefix}_all',
+                                   key=f'{env_prefix}-finance-db_uname')
+jdbcPassword = dbutils.secrets.get(scope=f'asql_jdbc_{env_prefix}_all',
+                                   key=f'{env_prefix}-finance-db_pass')
+
+# COMMAND ----------
+
+# DBTITLE 1,Pull results and result set details from intermediate tables
+# Read data from intermediate Databricks tables. This will either be a statically defined notebook name
+# or one provided to the notebook as an argument named 'month_results_table_name' in a dbutils.notebook.run call.
+(monthly_results_table, monthly_details_table) = construct_source_databricks_monthly_effect_table_names(experiment)
+
+# Check if a parameter was passed to this notebook
+try:
+    monthly_results_table = dbutils.widgets.get('month_results_table_name')
+except:
+    _logger.debug('No results table was passed in as a parameter to notebook')
+
+results_sdf = spark.table(monthly_results_table)
+details_sdf = spark.table(monthly_details_table)
+details_sdf = details_sdf.drop('estimation_scheme')
+
+# COMMAND ----------
+
+# DBTITLE 1,Transform the result set per the target database data model
+from pyspark.sql.functions import (col,
+                                   round as _round)
+
+#######################################################################################################################
+# The following code chunk prepares data for loading into Azure SQL, as well as containing workarounds and
+# fixes for the front end to be able to read from the data model. 
+#######################################################################################################################
+
+# This is a workaround given the implementation in the front end that always expects a level_3 column. In this case,
+# copy the level_2 column contents with the new column name 'level_3'. Remove this code chunk when no longer needed by
+# the front end. It's expected that a causal diagram will never have less than a level_2 column.
+if 'level_3' not in results_sdf.schema.names:
+    results_sdf = results_sdf.withColumn('level_3', col('level_2'))
+  
+# Downselect columns and cast to types matching the target table
+results_sdf = results_sdf.selectExpr(
+    "CAST(driver AS string) driver",
+    "CAST(mediator AS string) mediator",
+    *[f'CAST(level_{e} AS string) level_{e}' for e in range(results_causal_diagram_depth + 1)],
+  
+    "CAST(time_hierarchy_flag AS int) time_hierarchy_flag",
+    "CAST(day_nbr AS int) day_nbr",
+    "CAST(month_nbr AS int) month_nbr",
+    "CAST(qtr_nbr AS int) qtr_nbr",
+    "CAST(year_nbr AS int) year_nbr",
+
+    "CAST(merch_hierarchy_flag AS int) merch_hierarchy_flag",
+    "CAST(scan_id AS int) scan_id",
+    "CAST(item_desc AS string) item_desc",
+    "CAST(sub_category_nbr AS int) subclass_nbr",
+    "CAST(sub_category_desc AS string) subclass_desc",
+    "CAST(category_nbr AS int) dept_nbr",
+    "CAST(category_desc AS string) dept_desc",
+    "CAST(dmm_nbr AS int) dmm_nbr",
+    "CAST(dmm_desc AS string) dmm_desc",
+    "CAST(gmm_nbr AS int) gmm_nbr",
+    "CAST(gmm_desc AS string) gmm_desc",
+
+    "CAST(geography_hierarchy_flag AS int) geography_hierarchy_flag",
+    "CAST(club_nbr AS int) club_nbr",
+    "CAST(club_name AS string) club_name",
+    "CAST(market_area_nbr AS int) market_area_nbr",
+    "CAST(market_area_name AS string) market_area_name",
+    "CAST(region_nbr AS int) region_nbr",
+    "CAST(region_name AS string) region_name",
+
+    "CAST(update_ts AS string) update_ts",
+    "CAST(databricks_id AS int) databricks_id",
+    "CAST(driver_category as string) driver_category",
+
+    "CAST(avg_variance AS float) avg_variance",
+    "CAST(sum_responsibility AS float) dollar_variance_explained",
+    "CAST(overall_responsibility_prcnt AS float) percent_variance_explained",
+    "CAST(ctc_prcnt AS float) contribution_to_comp_percent")
+
+# This shim clamps some numeric values near 0 to 0, and also works to have some control over the max precision of numbers
+# shown in the UI. Ways this currently helps the UI are listed below.
+# 1) This prevents the UI from showing Unknown/Error records that hang directly under sales nodes.
+# 2) This helps prevent issues where an intended zero shows up as a positive or negative value (e.g., colored red or green).
+results_sdf = results_sdf.withColumn('dollar_variance_explained', _round(col('dollar_variance_explained'), scale=2))
+results_sdf = results_sdf.withColumn('percent_variance_explained', _round(col('percent_variance_explained'), scale=2))
+results_sdf = results_sdf.withColumn('contribution_to_comp_percent', _round(col('contribution_to_comp_percent'), scale=2))
+
+if debug_print:
+    results_sdf.show(n=3)
+
+# COMMAND ----------
+
+# DBTITLE 1,Define process to (read from/write to) Gravity Azure SQL database
+import logging
+import pyspark
+from pyspark.sql.functions import col
+from pyspark.sql.functions import create_map
+from pyspark.sql.functions import lit
+from itertools import chain
+
+def jdbc_write_sdf_to_azure_sql(sdf: pyspark.sql.dataframe.DataFrame,
+                                jdbcHostname: str,
+                                jdbcDatabase: str,
+                                jdbcPort: str,
+                                jdbcUsername: str,
+                                jdbcPassword: str,
+                                azure_sql_table_name: str,
+                                spark_jdbc_mode: str) -> None:
+    """Write Spark data frame contents to Azure SQL table (overwrite).
+    
+    This includes writes to the following tables.
+    1) [dbo].[sales_causal_aux_details] - A master entry for all results in this set to
+       be written to Azure. Contains details related to the run (e.g., causal analysis diagram
+       version used, first and last dates used in the analysis time interval, etc.)
+    2) [dbo].[sales_causal_explain] - Primary table for causal analysis results. Links to table
+       from (1) with the foreign key [analysis_id].
+    Parameters:
+        sdf - Spark Dataframe to write to Azure SQL table
+        jdbcHostname - Host name of target Azure SQL server
+        jdbcDatabase - Target database name
+        jdbcPort - Port of database server
+        jdbcUsername - Username for Azure SQL auth
+        jdbcPassword - Password for Azure SQL auth
+        azure_sql_table_name - Target Azure SQL table name
+        spark_jdbc_mode - Specifies behavior if data already exists in the target table. Options are:
+                          1) append: Append contents of this DataFrame to existing data.
+                          2) overwrite: Overwrite existing data.
+                          3) ignore: Silently ignore this operation if data already exists.
+                          4) error or errorifexists (default case): Throw exception if data exists.
+        
+    Returns:
+        None
+    """
+    
+    driver = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    jdbcUrl = "jdbc:sqlserver://{0}:{1};database={2}".format(jdbcHostname, jdbcPort, jdbcDatabase)
+    connectionProperties = {
+      "user" : jdbcUsername,
+      "password" : jdbcPassword,
+      "driver" : driver
+    }
+    
+    (sdf.write.option("truncate", "true")
+              .jdbc(jdbcUrl, azure_sql_table_name, spark_jdbc_mode, connectionProperties))
+    _logger.debug(f'Completed write to Azure SQL server {jdbcHostname}' +
+                  f' in table {jdbcDatabase}.{azure_sql_table_name}.')
+    return
+  
+def jdbc_read_sdf_from_azure_sql(jdbcHostname: str,
+                                 jdbcDatabase: str,
+                                 jdbcPort: str,
+                                 jdbcUsername: str,
+                                 jdbcPassword: str,
+                                 azure_sql_table_name: str) -> pyspark.sql.dataframe.DataFrame:
+    """Read table contents from Azure SQL table into a Spark DataFrame.
+    
+    Parameters:
+        jdbcHostname - Host name of target Azure SQL server
+        jdbcDatabase - Target database name
+        jdbcPort - Port of database server
+        jdbcUsername - Username for Azure SQL auth
+        jdbcPassword - Password for Azure SQL auth
+        azure_sql_table_name - Target Azure SQL table name
+        
+    Returns:
+        pyspark.sql.dataframe.DataFrame - Containing contents of source table
+    """
+    
+    driver = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    jdbcUrl = "jdbc:sqlserver://{0}:{1};database={2}".format(jdbcHostname, jdbcPort, jdbcDatabase)
+    connectionProperties = {
+      "user" : jdbcUsername,
+      "password" : jdbcPassword,
+      "driver" : driver
+    }
+    
+    sdf = spark.read.jdbc(url=jdbcUrl, table=azure_sql_table_name, properties=connectionProperties)
+    _logger.debug(f'Completed read from Azure SQL server {jdbcHostname}' +
+                  f' table {jdbcDatabase}.{azure_sql_table_name}.')
+    return sdf
+
+# COMMAND ----------
+
+# DBTITLE 1,Publish result set details to Azure SQL table
+jdbc_write_sdf_to_azure_sql(details_sdf, jdbcHostname, jdbcDatabase,
+                            jdbcPort, jdbcUsername, jdbcPassword,
+                            azure_sql_details_table_name, db_write_mode)
+_logger.debug(f'Result set details written in {db_write_mode} mode to Azure SQL server' +
+              f' {jdbcHostname} in table {jdbcDatabase}.{azure_sql_details_table_name}.')
+
+if debug_print:
+    details_sdf.show(n=10)
+
+# COMMAND ----------
+
+# DBTITLE 1,Read result set details from Azure SQL with autoincrement ID
+# Read records written to the Azure SQL table containing result details to discover what 
+# Azure result set IDs were acquired (i.e., those unique values automatically given to
+# each result set in Azure SQL to preserve having a unique ID for each experiment in Azure 
+# since the Databricks ID would no longer be sufficient).
+azure_monthly_details_sdf = jdbc_read_sdf_from_azure_sql(jdbcHostname, jdbcDatabase, jdbcPort,
+                                                         jdbcUsername, jdbcPassword, azure_sql_details_table_name)
+
+# The records printed here should match those printed in the previous command cell.
+if debug_print:
+    azure_monthly_details_sdf.show(n=10)
+
+# COMMAND ----------
+
+# DBTITLE 1,Map Databricks IDs in results to Azure SQL result IDs
+# Create an Azure SQL result set ID column in the results table
+join_conditions = ['databricks_id', 'databricks_ts']
+joined_details_sdf = (details_sdf.alias('local_details')
+                                 .join(other=azure_monthly_details_sdf, on=join_conditions, how='inner')
+                                 .select('local_details.*', 'analysis_id'))
+assert details_sdf.count() == joined_details_sdf.count(), 'There should be a 1-to-1 mapping in the previous join.'
+
+pre_join_row_count = results_sdf.count()
+results_sdf = results_sdf.join(other=joined_details_sdf.select('analysis_id', 'databricks_id'), on='databricks_id', how='inner')
+assert (pre_join_row_count == results_sdf.count()), 'Row count should not change due to mapping from databricks ID to Azure ID.' 
+
+if debug_print:
+    results_sdf.show(n=3)
+
+# COMMAND ----------
+
+# DBTITLE 1,Publish result set to Azure SQL
+jdbc_write_sdf_to_azure_sql(results_sdf, jdbcHostname, jdbcDatabase,
+                            jdbcPort, jdbcUsername, jdbcPassword,
+                            azure_sql_results_table_name, db_write_mode)
+_logger.debug(f'Result set details written in {db_write_mode} mode to Azure SQL server' +
+              f' {jdbcHostname} in table {jdbcDatabase}.{azure_sql_results_table_name}.')
